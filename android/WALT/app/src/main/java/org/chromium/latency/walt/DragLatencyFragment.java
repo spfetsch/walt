@@ -16,29 +16,29 @@
 
 package org.chromium.latency.walt;
 
+import android.app.Activity;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.os.Bundle;
 import android.support.v4.app.Fragment;
 import android.view.LayoutInflater;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.ImageButton;
 import android.widget.TextView;
 
+import java.io.IOException;
 import java.util.ArrayList;
 
 public class DragLatencyFragment extends Fragment
     implements View.OnClickListener {
 
-    SimpleLogger logger;
-
+    private Activity activity;
+    private SimpleLogger logger;
+    private ClockManager clockManager;
     TextView mLogTextView;
-    MainActivity activity;
-    TextView mTouchCatcher;
+    TouchCatcherView mTouchCatcher;
     int moveCount = 0;
     int allDownConunt = 0;
     int allUpConunt = 0;
@@ -66,10 +66,10 @@ public class DragLatencyFragment extends Fragment
 
             int histLen = event.getHistorySize();
             for (int i = 0; i < histLen; i++){
-                UsMotionEvent eh = new UsMotionEvent(event, activity.clockManager.baseTime, i);
+                UsMotionEvent eh = new UsMotionEvent(event, clockManager.baseTime, i);
                 touchEventList.add(eh);
             }
-            UsMotionEvent e = new UsMotionEvent(event, activity.clockManager.baseTime);
+            UsMotionEvent e = new UsMotionEvent(event, clockManager.baseTime);
             touchEventList.add(e);
             moveCount += histLen + 1;
 
@@ -86,12 +86,11 @@ public class DragLatencyFragment extends Fragment
     @Override
     public View onCreateView(LayoutInflater inflater, ViewGroup container,
                              Bundle savedInstanceState) {
+        activity = getActivity();
+        logger = SimpleLogger.getInstance(getContext());
+        clockManager = ClockManager.getInstance(getContext());
         // Inflate the layout for this fragment
-        activity = (MainActivity) getActivity();
-        View view =  inflater.inflate(R.layout.fragment_drag_latency, container, false);
-        logger = activity.logger;
-
-        return view;
+        return inflater.inflate(R.layout.fragment_drag_latency, container, false);
     }
 
     @Override
@@ -99,21 +98,20 @@ public class DragLatencyFragment extends Fragment
         super.onResume();
 
         mLogTextView = (TextView) activity.findViewById(R.id.txt_log_drag_latency);
-        mLogTextView.setText(activity.logger.getLogText());
-        activity.logger.broadcastManager.registerReceiver(mLogReceiver,
-                new IntentFilter(activity.logger.LOG_INTENT));
+        mLogTextView.setText(logger.getLogText());
+        logger.registerReceiver(mLogReceiver);
 
-        // Register this fregment class as the listener for some button clicks
-        ((ImageButton)activity.findViewById(R.id.button_restart_drag)).setOnClickListener(this);
-        ((ImageButton)activity.findViewById(R.id.button_start_drag)).setOnClickListener(this);
-        ((ImageButton)activity.findViewById(R.id.button_finish_drag)).setOnClickListener(this);
+        // Register this fragment class as the listener for some button clicks
+        activity.findViewById(R.id.button_restart_drag).setOnClickListener(this);
+        activity.findViewById(R.id.button_start_drag).setOnClickListener(this);
+        activity.findViewById(R.id.button_finish_drag).setOnClickListener(this);
 
-        mTouchCatcher = (TextView) activity.findViewById(R.id.tap_catcher);
+        mTouchCatcher = (TouchCatcherView) activity.findViewById(R.id.tap_catcher);
     }
 
     @Override
     public void onPause() {
-        activity.logger.broadcastManager.unregisterReceiver(mLogReceiver);
+        logger.unregisterReceiver(mLogReceiver);
         super.onPause();
     }
 
@@ -133,21 +131,33 @@ public class DragLatencyFragment extends Fragment
 
     void startMeasurement() {
         logger.log("Starting drag latency test");
-        activity.clockManager.syncClock();
+        try {
+            clockManager.syncClock();
+        } catch (IOException e) {
+            logger.log("Error syncing clocks: " + e.getMessage());
+            return;
+        }
         mTouchCatcher.setOnTouchListener(mTouchListener);
-        activity.clockManager.sendReceive(ClockManager.CMD_AUTO_LASER_ON);
-        // Register a callback for broadcasts
-        activity.broadcastManager.registerReceiver(
-                onIncomingTimestamp,
-                new IntentFilter(activity.clockManager.INCOMING_DATA_INTENT)
-        );
-        activity.clockManager.startUsbListener();
+        // Register a callback for triggers
+        clockManager.setTriggerHandler(triggerHandler);
+        try {
+            clockManager.command(ClockManager.CMD_AUTO_LASER_ON);
+            clockManager.startListener();
+        } catch (IOException e) {
+            logger.log("Error: " + e.getMessage());
+        }
+        mTouchCatcher.startAnimation();
     }
 
-
     void restartMeasurement() {
-        activity.logger.log("\n## Restarting tap latency  measurement. Re-sync clocks ...");
-        activity.clockManager.syncClock();
+        logger.log("\n## Restarting tap latency  measurement. Re-sync clocks ...");
+        try {
+            clockManager.syncClock();
+        } catch (IOException e) {
+            logger.log("Error syncing clocks: " + e.getMessage());
+        }
+
+        mTouchCatcher.startAnimation();
 
         touchEventList.clear();
 
@@ -162,10 +172,17 @@ public class DragLatencyFragment extends Fragment
 
 
     void finishAndShowStats() {
-        activity.clockManager.stopUsbListener();
-        activity.clockManager.sendReceive(ClockManager.CMD_AUTO_LASER_OFF);
+        mTouchCatcher.stopAnimation();
+        clockManager.stopListener();
+        try {
+            clockManager.command(ClockManager.CMD_AUTO_LASER_OFF);
+        } catch (IOException e) {
+            logger.log("Error: " + e.getMessage());
+        }
         mTouchCatcher.setOnTouchListener(null);
-        activity.broadcastManager.unregisterReceiver(onIncomingTimestamp);
+        clockManager.clearTriggerHandler();
+
+        clockManager.checkDrift();
 
         logger.log(String.format(
                 "Recorded %d laser events and %d touch events. ",
@@ -282,20 +299,11 @@ public class DragLatencyFragment extends Fragment
 
     }
 
-
-    private BroadcastReceiver onIncomingTimestamp = new BroadcastReceiver() {
+    private ClockManager.TriggerHandler triggerHandler = new ClockManager.TriggerHandler() {
         @Override
-        public void onReceive(Context context, Intent intent) {
-
-            String msg = intent.getStringExtra("message");
-            logger.log("Incoming timestamp received: " + msg.trim());
-
-
-            ClockManager.TriggerMessage tmsg = activity.clockManager.parseTriggerMessage(msg);
-
+        public void onReceive(ClockManager.TriggerMessage tmsg) {
             laserEventList.add(tmsg);
             updateCountsDisplay();
-
         }
     };
 

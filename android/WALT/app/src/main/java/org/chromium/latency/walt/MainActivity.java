@@ -16,14 +16,22 @@
 
 package org.chromium.latency.walt;
 
+import android.Manifest;
 import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.hardware.usb.UsbDevice;
+import android.hardware.usb.UsbManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
+import android.support.annotation.NonNull;
+import android.support.v4.app.ActivityCompat;
 import android.support.v4.app.Fragment;
+import android.support.v4.app.FragmentManager;
 import android.support.v4.app.FragmentTransaction;
+import android.support.v4.content.ContextCompat;
 import android.support.v4.content.LocalBroadcastManager;
 import android.support.v7.app.AppCompatActivity;
 import android.support.v7.widget.Toolbar;
@@ -33,20 +41,24 @@ import android.view.MenuItem;
 import android.view.View;
 import android.widget.Toast;
 
+import org.chromium.latency.walt.programmer.Programmer;
+
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.util.Date;
-
+import java.util.Locale;
 
 public class MainActivity extends AppCompatActivity {
     private static final String TAG = "WALT";
+    private static final int PERMISSION_REQUEST_WRITE_EXTERNAL_STORAGE = 2;
 
     private Toolbar toolbar;
     LocalBroadcastManager broadcastManager;
-    public SimpleLogger logger = new SimpleLogger();
-    public ClockManager clockManager;
+    private SimpleLogger logger;
+    private ClockManager clockManager;
     public Menu mMenu;
 
     public Handler handler = new Handler();
@@ -78,6 +90,46 @@ public class MainActivity extends AppCompatActivity {
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+
+        final UsbDevice usbDevice;
+        Intent intent = getIntent();
+        if (intent != null && intent.getAction().equals(UsbManager.ACTION_USB_DEVICE_ATTACHED)) {
+            setIntent(null); // done with the intent
+            usbDevice = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+        } else {
+            usbDevice = null;
+        }
+
+        // Connect and sync clocks, but a bit later as it takes time
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                if (usbDevice == null) {
+                    clockManager.connect();
+                } else {
+                    clockManager.connect(usbDevice);
+                }
+            }
+        });
+
+        if (intent != null && AutoRunFragment.TEST_ACTION.equals(intent.getAction())) {
+            getSupportFragmentManager().popBackStack("Automated Test",
+                    FragmentManager.POP_BACK_STACK_INCLUSIVE);
+            Fragment autoRunFragment = new AutoRunFragment();
+            autoRunFragment.setArguments(intent.getExtras());
+            switchScreen(autoRunFragment, "Automated Test");
+        }
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+    }
+
+    @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         Thread.setDefaultUncaughtExceptionHandler(new LoggingExceptionHandler());
@@ -87,19 +139,7 @@ public class MainActivity extends AppCompatActivity {
         toolbar = (Toolbar) findViewById(R.id.toolbar_main);
         setSupportActionBar(toolbar);
 
-        clockManager = new ClockManager(this, logger);
-
-        // Connect and sync clocks, but a bit later as it takes time
-        handler.post(new Runnable() {
-            @Override
-            public void run() {
-                clockManager.connect();
-                // TODO: Do we need to sync here? Sync is done before each measurement.
-                // Ideally we need to sync here and check whether the process works ok
-                // on Nexus 9 it sometimes hangs for ~5 seconds.
-                clockManager.syncClock();
-            }
-        });
+        clockManager = ClockManager.getInstance(this);
 
         // Create front page fragment
         FrontPageFragment frontPageFragment = new FrontPageFragment();
@@ -107,14 +147,14 @@ public class MainActivity extends AppCompatActivity {
         transaction.add(R.id.fragment_container, frontPageFragment);
         transaction.commit();
 
+        logger = SimpleLogger.getInstance(this);
         broadcastManager = LocalBroadcastManager.getInstance(this);
-        logger.setBroadcastManager(broadcastManager);
 
         // Add basic device info to the log
         logger.log("DEVICE INFO");
-        logger.log("  os.version=" + System.getProperty("os.version"));
+        logger.log("  " + Build.FINGERPRINT);
         logger.log("  Build.SDK_INT=" + Build.VERSION.SDK_INT);
-        logger.log("  Build.DEVICE=" + Build.DEVICE);
+        logger.log("  os.version=" + System.getProperty("os.version"));
     }
 
     @Override
@@ -154,8 +194,7 @@ public class MainActivity extends AppCompatActivity {
             case R.id.action_help:
                 return true;
             case R.id.action_share:
-                String filepath = saveLogToFile();
-                shareLogFile(filepath);
+                attemptSaveAndShareLog();
                 return true;
             case R.id.action_upload:
                 return true;
@@ -173,7 +212,7 @@ public class MainActivity extends AppCompatActivity {
         toolbar.setTitle(title);
         FragmentTransaction transaction = getSupportFragmentManager().beginTransaction();
         transaction.replace(R.id.fragment_container, newFragment);
-        transaction.addToBackStack(null);
+        transaction.addToBackStack(title);
         transaction.commit();
     }
 
@@ -194,7 +233,12 @@ public class MainActivity extends AppCompatActivity {
 
     public void onClickAudio(View view) {
         AudioFragment newFragment = new AudioFragment();
-        switchScreen(newFragment, "Audio Output");
+        switchScreen(newFragment, "Audio Latency");
+    }
+
+    public void onClickMIDI(View view) {
+        MidiFragment newFragment = new MidiFragment();
+        switchScreen(newFragment, "MIDI Latency");
     }
 
     public void onClickDragLatency(View view) {
@@ -216,30 +260,36 @@ public class MainActivity extends AppCompatActivity {
     }
 
     public void onClickPing(View view) {
-        // TODO: this prints "ping reply" even if there is no connection, do something about it
         long t1 = clockManager.micros();
-        String s = clockManager.sendReceive('P');
-        long dt = clockManager.micros() - t1;
-        logger.log(String.format(
-                "Ping reply in %.1fms: \"%s\"", dt / 1000.,
-                s.trim()
-        ));
-    }
-
-    public void onClickSendT(View view) {
-        clockManager.sendByte('T');
+        try {
+            clockManager.command(ClockManager.CMD_PING);
+            long dt = clockManager.micros() - t1;
+            logger.log(String.format(Locale.US,
+                    "Ping reply in %.1fms", dt / 1000.
+            ));
+        } catch (IOException e) {
+            logger.log("Error sending ping: " + e.getMessage());
+        }
     }
 
     public void onClickStartListener(View view) {
         if (clockManager.isListenerStopped()) {
-            clockManager.startUsbListener();
+            try {
+                clockManager.startListener();
+            } catch (IOException e) {
+                logger.log("Error starting USB listener: " + e.getMessage());
+            }
         } else {
-            clockManager.stopUsbListener();
+            clockManager.stopListener();
         }
     }
 
     public void onClickSync(View view) {
-        clockManager.syncClock();
+        try {
+            clockManager.syncClock();
+        } catch (IOException e) {
+            logger.log("Error syncing clocks: " + e.getMessage());
+        }
     }
 
     public void onClickCheckDrift(View view) {
@@ -247,6 +297,36 @@ public class MainActivity extends AppCompatActivity {
         int minE = clockManager.getMinE();
         int maxE = clockManager.getMaxE();
         logger.log(String.format("Remote clock delayed between %d and %d us", minE, maxE));
+    }
+
+    public void onClickProgram(View view) {
+        new Programmer(this).program();
+    }
+
+    private void attemptSaveAndShareLog() {
+        int currentPermission = ContextCompat.checkSelfPermission(this,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE);
+        if (currentPermission == PackageManager.PERMISSION_GRANTED) {
+            String filePath = saveLogToFile();
+            shareLogFile(filePath);
+        } else {
+            ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE},
+                    PERMISSION_REQUEST_WRITE_EXTERNAL_STORAGE);
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
+        switch (requestCode) {
+            case PERMISSION_REQUEST_WRITE_EXTERNAL_STORAGE:
+                if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                    attemptSaveAndShareLog();
+                } else {
+                    logger.log("Could not get permission to write log file");
+                }
+                return;
+        }
     }
 
     public String saveLogToFile() {
